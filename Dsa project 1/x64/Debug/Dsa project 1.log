@@ -1,0 +1,3 @@
+﻿  server .cpp
+D:\SEM3\DSA\Dsa project 1\Dsa project 1\server .cpp(293,18): warning C4267: 'initializing': conversion from 'size_t' to 'int32_t', possible loss of data
+  Dsa project 1.vcxproj -> D:\SEM3\DSA\Dsa project 1\x64\Debug\Dsa project 1.exe

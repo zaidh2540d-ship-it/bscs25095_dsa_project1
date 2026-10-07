@@ -1,0 +1,9 @@
+func add a b
+set result a
+add result b
+func_end
+func main
+set x 10
+set y 20
+call add x y
+func_end
