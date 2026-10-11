@@ -1,3 +1,6 @@
 ﻿  server .cpp
 D:\SEM3\DSA\Dsa project 1\Dsa project 1\server .cpp(293,18): warning C4267: 'initializing': conversion from 'size_t' to 'int32_t', possible loss of data
+D:\SEM3\DSA\Dsa project 1\Dsa project 1\server .cpp(459,15): warning C4267: 'initializing': conversion from 'size_t' to 'int32_t', possible loss of data
+D:\SEM3\DSA\Dsa project 1\Dsa project 1\server .cpp(558,18): warning C4244: 'argument': conversion from 'int64_t' to 'long', possible loss of data
+D:\SEM3\DSA\Dsa project 1\Dsa project 1\server .cpp(667,26): warning C4244: 'argument': conversion from 'int64_t' to 'long', possible loss of data
   Dsa project 1.vcxproj -> D:\SEM3\DSA\Dsa project 1\x64\Debug\Dsa project 1.exe
