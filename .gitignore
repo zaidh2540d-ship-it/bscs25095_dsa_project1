@@ -1,1 +1,8 @@
 .vs/
+server
+server .exe
+client
+load_balancer
+test_crc
+ttdb_last.tdbg
+.vscode/
