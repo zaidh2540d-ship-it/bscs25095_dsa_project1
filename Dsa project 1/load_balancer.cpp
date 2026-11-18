@@ -36,6 +36,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "helper.h"
@@ -256,7 +257,75 @@ int connectToServerWithWakeup()
 // PART 2: PASSING THE STRING AND THE REPLY (one client, called by the main thread only)
 // =============================================================================================
 
-
+bool relayStream(int fromSock, int toSock, bool &gotData, bool &checksumOk)
+{
+    char buf[IO_BUFFER_SIZE];
+    TrailerChecker checker;
+    CRC32 outCrc;
+    gotData = false;
+    checksumOk = false;
+    while (true)
+    {
+        ssize_t n = recv(fromSock, buf, sizeof(buf), 0);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (n == 0)
+            break;
+        const char *p = buf;
+        size_t len = (size_t)n;
+        if (!gotData)
+        {
+            checker.addPrefixByte(p[0]);
+            outCrc.update(p, 1);
+            if (!sendAll(toSock, p, 1))
+                return false;
+            gotData = true;
+            p++;
+            len--;
+        }
+        string safe = checker.feed(p, len);
+        if (!safe.empty())
+        {
+            outCrc.update(safe.data(), safe.size());
+            if (!sendAll(toSock, safe.data(), safe.size()))
+                return false;
+        }
+    }
+    if (!gotData)
+        return true;
+    checksumOk = checker.verify();
+    if (checksumOk)
+    {
+        char trailer[CHECKSUM_SIZE];
+        encode32(outCrc.value(), trailer);
+        if (!sendAll(toSock, trailer, CHECKSUM_SIZE))
+            return false;
+    }
+    return true;
+}
+void finishWithError(int sock, const string &message)
+{
+    sendError(sock, message);
+    shutdown(sock, SHUT_WR);
+    timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[IO_BUFFER_SIZE];
+    while (true)
+    {
+        ssize_t n = recv(sock, buf, sizeof(buf), 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+    }
+    close(sock);
+}
 void relayOneClient(ClientInfo &c)
 {
     // 1. serverSock = connectToServerWithWakeup().
@@ -267,6 +336,38 @@ void relayOneClient(ClientInfo &c)
     // 5. Server -> client: repeat recv() from serverSock and sendAll() to clientSock.
     //    Stop when recv() returns 0 (the server sent its whole reply and closed) or fails.
     // 6. Close both sockets.
+   int serverSock = connectToServerWithWakeup();
+if (serverSock < 0)
+{
+    finishWithError(c.sock, "backend server failed to start");
+    return;
+}
+timeval tv;
+tv.tv_sec = CLIENT_TIMEOUT_SEC;
+tv.tv_usec = 0;
+setsockopt(c.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+setsockopt(serverSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+bool gotData = false;
+bool checksumOk = false;
+bool ioOk = relayStream(c.sock, serverSock, gotData, checksumOk);
+if (!ioOk)
+{
+    close(serverSock);
+    finishWithError(c.sock, "backend server failed to start");
+    return;
+}
+if (!gotData || !checksumOk)
+{
+    close(serverSock);
+    finishWithError(c.sock, "upload checksum mismatch");
+    return;
+}
+shutdown(serverSock, SHUT_WR);
+ioOk = relayStream(serverSock, c.sock, gotData, checksumOk);
+if (ioOk && !gotData)
+    sendError(c.sock, "backend server failed to start");
+close(serverSock);
+close(c.sock);
 }
 
 
@@ -285,6 +386,39 @@ void acceptLoop(int listenSock)
     //   Otherwise enqueue the client socket.
     // Never wait for the server here, so new clients are always accepted quickly.
     // If accept() fails, print the error and keep going (do not end the thread).
+    while (flag)
+{
+    sockaddr_in caddr;
+    socklen_t clen = sizeof(caddr);
+    int cs = accept4(listenSock, (sockaddr *)&caddr, &clen, SOCK_CLOEXEC);
+    if (cs < 0)
+    {
+        if (errno != EINTR)
+            perror("accept");
+        continue;
+    }
+    ClientInfo c;
+    c.sock = cs;
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &caddr.sin_addr, ip, sizeof(ip));
+    c.address = ip;
+    c.port = ntohs(caddr.sin_port);
+    c.arrivedAt = time(nullptr);
+    bool full = false;
+    {
+        lock_guard<mutex> lock(queueMutex);
+        if (pendingClients.size() >= MAX_PENDING_CLIENTS)
+            full = true;
+        else
+            pendingClients.enqueue(c);
+    }
+    if (full)
+    {
+        sendError(cs, "server busy, try again later");
+        shutdown(cs, SHUT_WR);
+        close(cs);
+    }
+}
 }
 void dispatcherLoop()
 {
@@ -292,6 +426,30 @@ void dispatcherLoop()
     // Repeat:
     //   Lock queueMutex, take ONE client out of the queue if there is one, unlock.
     //   If we got a client: call relayOneClient(). The next client is taken out of the queue only after this one is finished.
+while (flag)
+{
+    bool have = false;
+    ClientInfo c;
+    {
+        lock_guard<mutex> lock(queueMutex);
+        if (!pendingClients.isEmpty())
+        {
+            c = pendingClients.dequeue();
+            have = true;
+        }
+    }
+    if (!have)
+    {
+        usleep(50 * 1000);
+        continue;
+    }
+    if (time(nullptr) - c.arrivedAt > CLIENT_TIMEOUT_SEC)
+    {
+        close(c.sock);
+        continue;
+    }
+    relayOneClient(c);
+}
 }
 
 void handler(int sg) {
@@ -305,5 +463,20 @@ int main(int argc, char *argv[])
     // 2. listenSock = createListenSocket(LB_PORT).
     // 3. Start a thread that runs acceptLoop(listenSock) and detach it.
     // 4. Call dispatcherLoop().
+    if (argc >= 3)
+{
+    serverHost = argv[1];
+    serverPort = atoi(argv[2]);
+}
+int listenSock = createListenSocket(lbPort);
+thread acceptor(acceptLoop, listenSock);
+acceptor.detach();
+dispatcherLoop();
+close(listenSock);
+{
+    lock_guard<mutex> lock(queueMutex);
+    while (!pendingClients.isEmpty())
+        close(pendingClients.dequeue().sock);
+}
     return 0;
 }

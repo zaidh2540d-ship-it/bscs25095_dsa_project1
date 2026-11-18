@@ -10,6 +10,7 @@ using namespace std;
 const char STATUS_OK = 0;
 const char STATUS_ERROR = 1;
 const int CHECKSUM_SIZE = 4;
+const int CLIENT_TIMEOUT_SEC = 30;
 
 struct FuncEntry
 {

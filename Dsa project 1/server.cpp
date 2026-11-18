@@ -16,6 +16,14 @@
 #include <sys/socket.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
+#include <sstream>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
+#include "helper.h"
 using namespace std;
 
 // ---- Constants ----
@@ -198,20 +206,6 @@ void writeHeader(FILE* f, const TTDBHeader& h)
     fwrite(&h.stepCount, sizeof(int32_t), 1, f);
     fwrite(&h.indexOffset, sizeof(int64_t), 1, f);
 }
-
-// resolve.bin - bookkeeping
-struct FuncEntry
-{
-    string funcName;
-    int64_t byteOffsetInResolveBin; // where this function's FUNC header record sits
-};
-struct PendingPatch
-{
-    int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
-    string targetFuncName;
-};
-
-
 
 // PASS 0x0: READING source.bin + VALIDITY CHECK
 bool readSourceLine(ifstream &in, string &out)
@@ -800,22 +794,218 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
     fclose(f);
 }
 // main section
-int32_t main()
+bool sendAll(int sock, const char *buf, size_t n)
 {
+    size_t sent = 0;
+    while (sent < n)
+    {
+        ssize_t r = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (r == 0)
+            return false;
+        sent += (size_t)r;
+    }
+    return true;
+}
+bool sendError(int sock, const string &message)
+{
+    char status = STATUS_ERROR;
+    CRC32 crc;
+    crc.update(&status, 1);
+    crc.update(message.data(), message.size());
+    char trailer[CHECKSUM_SIZE];
+    encode32(crc.value(), trailer);
+    return sendAll(sock, &status, 1) &&
+           sendAll(sock, message.data(), message.size()) &&
+           sendAll(sock, trailer, CHECKSUM_SIZE);
+}
+void freeTimeline(Timeline &timeline)
+{
+    TimelineNode *n = timeline.begin();
+    while (n != nullptr)
+    {
+        TimelineNode *next = n->next;
+        delete n->data;
+        delete n;
+        n = next;
+    }
+}
+bool runPipeline(string &errorText)
+{
+    remove("session.tdbg");
+    ostringstream captured;
+    streambuf *oldBuf = cout.rdbuf(captured.rdbuf());
+    bool ok = false;
 
     if (!validateProgram("source.bin"))
     {
         // send an error response instead of a .tdbg file
         cout << "Program is not valid";
-        return 1;
+    }
+    else
+    {
+        int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
+        if (mainOffset != -1)
+        {
+            Timeline timeline;
+            executeProgram("resolve.bin", mainOffset, timeline);
+            if (timeline.getStepCount() > 0)
+            {
+                writeTdbg(timeline, "session.tdbg");
+                ok = true;
+            }
+            else if (captured.str().empty())
+                cout << "Error: program produced no steps";
+            freeTimeline(timeline);
+        }
     }
 
-    int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
-    if (mainOffset == -1)
-        return 1;
-    Timeline timeline;
-    executeProgram("resolve.bin", mainOffset, timeline);
+    cout.rdbuf(oldBuf);
+    errorText = captured.str();
+    while (!errorText.empty() && (errorText.back() == '\n' || errorText.back() == '\r'))
+        errorText.pop_back();
+    if (ok && !errorText.empty())
+        cerr << errorText << endl;
+    if (!ok && errorText.empty())
+        errorText = "program failed";
+    return ok;
+}
+bool receiveUpload(int sock, const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    char buf[IO_BUFFER_SIZE];
+    TrailerChecker checker;
+    bool gotStatus = false;
+    char status = 0;
+    uint64_t total = 0;
+    bool ok = true;
+    while (true)
+    {
+        ssize_t n = recv(sock, buf, sizeof(buf), 0);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            ok = false;
+            break;
+        }
+        if (n == 0)
+            break;
+        const char *p = buf;
+        size_t len = (size_t)n;
+        if (!gotStatus)
+        {
+            status = p[0];
+            checker.addPrefixByte(status);
+            gotStatus = true;
+            p++;
+            len--;
+        }
+        string safe = checker.feed(p, len);
+        total += safe.size();
+        if (total > MAX_SOURCE_BYTES)
+        {
+            ok = false;
+            break;
+        }
+        if (!safe.empty())
+            fwrite(safe.data(), 1, safe.size(), f);
+    }
+    fclose(f);
+    if (!ok || !gotStatus || status != STATUS_OK)
+        return false;
+    return checker.verify();
+}
+bool sendTdbg(int sock, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return sendError(sock, "server could not open the .tdbg file");
+    char status = STATUS_OK;
+    CRC32 crc;
+    crc.update(&status, 1);
+    bool ok = sendAll(sock, &status, 1);
+    char buf[IO_BUFFER_SIZE];
+    size_t n;
+    while (ok && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+    {
+        crc.update(buf, n);
+        ok = sendAll(sock, buf, n);
+    }
+    fclose(f);
+    if (!ok)
+        return false;
+    char trailer[CHECKSUM_SIZE];
+    encode32(crc.value(), trailer);
+    return sendAll(sock, trailer, CHECKSUM_SIZE);
+}
+void handleClient(int sock)
+{
+    timeval tv;
+    tv.tv_sec = SOCKET_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    writeTdbg(timeline, "session.tdbg");
+    if (!receiveUpload(sock, "source.bin"))
+    {
+        sendError(sock, "upload checksum mismatch");
+        return;
+    }
+    string errorText;
+    if (!runPipeline(errorText))
+    {
+        sendError(sock, errorText);
+        return;
+    }
+    sendTdbg(sock, "session.tdbg");
+}
+int main(int argc, char *argv[])
+{
+    int port = 5001;
+    if (argc >= 2)
+        port = atoi(argv[1]);
+
+    int listenSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenSock < 0)
+    {
+        perror("socket");
+        return 1;
+    }
+    int yes = 1;
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(listenSock, (sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        perror("bind");
+        return 1;
+    }
+    if (listen(listenSock, 16) < 0)
+    {
+        perror("listen");
+        return 1;
+    }
+    while (true)
+    {
+        int cs = accept(listenSock, nullptr, nullptr);
+        if (cs < 0)
+        {
+            if (errno != EINTR)
+                perror("accept");
+            continue;
+        }
+        handleClient(cs);
+        close(cs);
+    }
     return 0;
 }
